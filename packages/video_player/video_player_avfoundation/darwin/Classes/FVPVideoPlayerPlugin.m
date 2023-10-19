@@ -10,7 +10,7 @@
 
 #import "AVAssetTrackUtils.h"
 #import "messages.g.h"
-
+#import "M3U8PlaylistModel.h"
 #if !__has_feature(objc_arc)
 #error Code Requires ARC.
 #endif
@@ -71,7 +71,7 @@ static CVReturn DisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTimeSt
 
 @end
 
-@interface FVPVideoPlayer : NSObject <FlutterTexture, FlutterStreamHandler>
+@interface FVPVideoPlayer : NSObject <FlutterTexture, FlutterStreamHandler,AVAssetResourceLoaderDelegate>
 @property(readonly, nonatomic) AVPlayer *player;
 @property(readonly, nonatomic) AVPlayerItemVideoOutput *videoOutput;
 // This is to fix 2 bugs: 1. blank video for encrypted video streams on iOS 16
@@ -282,12 +282,127 @@ NS_INLINE CGFloat radiansToDegrees(CGFloat radians) {
   if ([headers count] != 0) {
     options = @{@"AVURLAssetHTTPHeaderFieldsKey" : headers};
   }
-  AVURLAsset *urlAsset = [AVURLAsset URLAssetWithURL:url options:options];
-  AVPlayerItem *item = [AVPlayerItem playerItemWithAsset:urlAsset];
-  return [self initWithPlayerItem:item
-                     frameUpdater:frameUpdater
-                    playerFactory:playerFactory
-                        registrar:registrar];
+    NSURLComponents *comp = [NSURLComponents componentsWithURL:url resolvingAgainstBaseURL:false];
+    if([comp.scheme isEqualToString:@"http"] || [comp.scheme isEqualToString:@"https"]){
+        comp.scheme = @"fakehttp";
+    }
+    
+    AVURLAsset *asset = [AVURLAsset URLAssetWithURL:comp.URL options:options];
+    AVAssetResourceLoader *loader = asset.resourceLoader;
+    [loader setDelegate:self queue:dispatch_get_main_queue()];
+    dispatch_semaphore_t semaphore = dispatch_semaphore_create(0);
+    [asset loadValuesAsynchronouslyForKeys:@[@"playable"] completionHandler:^{
+        NSError *error = nil;
+        AVKeyValueStatus keyStatus = [asset statusOfValueForKey:@"playable" error:&error];
+        
+        if (keyStatus == AVKeyValueStatusFailed) {
+            NSLog(@"Asset status failed, reason: %@", error);
+            dispatch_semaphore_signal(semaphore);
+            return;
+        }
+        
+        if (!asset.isPlayable) {
+            // Handle if asset is not playable
+            dispatch_semaphore_signal(semaphore);
+            return;
+        }
+        
+       
+        // Signal that the operation is complete
+        dispatch_semaphore_signal(semaphore);
+    }];
+
+    // Wait for the semaphore
+    dispatch_semaphore_wait(semaphore, DISPATCH_TIME_FOREVER);
+//    [NSThread sleepForTimeInterval:3.0];
+    AVPlayerItem *playerItem = [AVPlayerItem playerItemWithAsset:asset];
+//    [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(playerItemDidReachEnd:) name:AVPlayerItemDidPlayToEndTimeNotification object:playerItem];
+    return [self initWithPlayerItem:playerItem frameUpdater:frameUpdater playerFactory:playerFactory registrar:registrar];
+}
+
+- (BOOL)resourceLoader:(AVAssetResourceLoader *)resourceLoader shouldWaitForLoadingOfRequestedResource:(AVAssetResourceLoadingRequest *)loadingRequest {
+    NSString *url = loadingRequest.request.URL.absoluteString;
+    AVAssetResourceLoadingContentInformationRequest *contentRequest = loadingRequest.contentInformationRequest;
+    AVAssetResourceLoadingDataRequest *dataRequest = loadingRequest.dataRequest;
+    
+    if (contentRequest) {
+        contentRequest.byteRangeAccessSupported = YES;
+    }
+    
+    if (dataRequest) {
+        url = [url stringByReplacingOccurrencesOfString:@"fakehttp" withString:@"https"];
+        
+        if ([url containsString:@".m3u8"]) {
+            [self parsingHandlerWithUrl:url loadingRequest:loadingRequest completion:^(BOOL success) {
+                // Handle completion if needed
+            }];
+            return YES;
+        } else if ([url containsString:@".ts"]) {
+            // Generate redirect URL and finish loading request
+            loadingRequest.redirect = [self generateRedirectURLRequestWithSourceURL:url];
+            NSHTTPURLResponse *response = [[NSHTTPURLResponse alloc] initWithURL:[NSURL URLWithString:url] statusCode:302 HTTPVersion:nil headerFields:nil];
+            loadingRequest.response = response;
+            [loadingRequest finishLoading];
+            return YES;
+        }
+        return YES;
+    }
+    
+    return YES;
+}
+
+- (void)parsingHandlerWithUrl:(NSString *)url loadingRequest:(AVAssetResourceLoadingRequest *)loadingRequest completion:(void (^)(BOOL))completion {
+    NSString *string = @"";
+    NSMutableArray<NSString *> *originalURIStrings = [NSMutableArray array];
+    NSMutableArray<NSString *> *updatedURIStrings = [NSMutableArray array];
+    
+    @try {
+        NSError *errorz = nil;
+        M3U8PlaylistModel *model = [[M3U8PlaylistModel alloc] initWithURL:[NSURL URLWithString:url] error:&errorz];
+        if (model.masterPlaylist == nil) {
+            string = model.mainMediaPl.originalText;
+            NSArray *array = [string componentsSeparatedByCharactersInSet:[NSCharacterSet newlineCharacterSet]];
+            if (array.count > 0) {
+                for (NSString *line in array) {
+                    if ([line containsString:@"EXT-X-KEY:"]) {
+                        NSArray *furtherComponents = [line componentsSeparatedByString:@","];
+                        for (NSString *component in furtherComponents) {
+                            if ([component containsString:@"URI"]) {
+                                [originalURIStrings addObject:component];
+                                NSString *finalString = [component stringByReplacingOccurrencesOfString:@"URI=\"" withString:@""];
+                                finalString = [finalString stringByReplacingOccurrencesOfString:@"\"" withString:@""];
+                                //                                        finalString = [NSString stringWithFormat:@"\"%@&token=%@\"", finalString, self.token];
+                                finalString = [NSString stringWithFormat:@"URI=%@", finalString];
+                                [updatedURIStrings addObject:finalString];
+                            }
+                        }
+                    }
+                }
+            }
+            
+            if (originalURIStrings.count == updatedURIStrings.count) {
+                for (NSString *uriElement in originalURIStrings) {
+                    string = [string stringByReplacingOccurrencesOfString:uriElement withString:updatedURIStrings[[originalURIStrings indexOfObject:uriElement]]];
+                }
+            }
+        } else {
+            string = model.masterPlaylist.originalText;
+        }
+    } @catch (NSException *exception) {
+        NSLog(@"Exception encountered: %@", exception);
+    }
+    
+    [loadingRequest.dataRequest respondWithData:[string dataUsingEncoding:NSUTF8StringEncoding]];
+    [loadingRequest finishLoading];
+    
+    if (completion != nil) {
+        completion(YES);
+    }
+}
+
+- (NSURLRequest *)generateRedirectURLRequestWithSourceURL:(NSString *)sourceURL {
+    NSURLRequest *redirect = [NSURLRequest requestWithURL:[NSURL URLWithString:sourceURL]];
+    return redirect;
 }
 
 - (instancetype)initWithPlayerItem:(AVPlayerItem *)item
