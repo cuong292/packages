@@ -175,7 +175,7 @@ class _BumbleBeeEncryptedLiveStreamState
   void initState() {
     super.initState();
     _controller = MiniController.network(
-      'https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8',
+      'https://playertest.longtailvideo.com/adaptive/oceans_aes/oceans_aes.m3u8',
     );
 
     _controller.addListener(() {
