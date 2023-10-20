@@ -321,12 +321,24 @@ NS_INLINE CGFloat radiansToDegrees(CGFloat radians) {
 }
 
 - (BOOL)resourceLoader:(AVAssetResourceLoader *)resourceLoader shouldWaitForLoadingOfRequestedResource:(AVAssetResourceLoadingRequest *)loadingRequest {
-    NSString *url = loadingRequest.request.URL.absoluteString;
+    NSURL *requestURL = loadingRequest.request.URL;
+    NSString *url = requestURL.absoluteString;
     AVAssetResourceLoadingContentInformationRequest *contentRequest = loadingRequest.contentInformationRequest;
     AVAssetResourceLoadingDataRequest *dataRequest = loadingRequest.dataRequest;
     
     if (contentRequest) {
         contentRequest.byteRangeAccessSupported = YES;
+    }
+    
+    if([requestURL.scheme isEqualToString:@"fakekeyhttp"]){
+        NSString *keyURL = [requestURL.absoluteString stringByReplacingOccurrencesOfString:@"fakekeyhttp" withString:@"https"];
+        NSData* hlsKey = [self getKeyFromKeychain:keyURL];
+        loadingRequest.contentInformationRequest.contentType = AVStreamingKeyDeliveryPersistentContentKeyType;
+        loadingRequest.contentInformationRequest.byteRangeAccessSupported = YES;
+        loadingRequest.contentInformationRequest.contentLength = hlsKey.length;
+        [loadingRequest.dataRequest respondWithData:hlsKey];
+        [loadingRequest finishLoading];
+        return YES;
     }
     
     if (dataRequest) {
@@ -365,17 +377,24 @@ NS_INLINE CGFloat radiansToDegrees(CGFloat radians) {
             if (array.count > 0) {
                 for (NSString *line in array) {
                     if ([line containsString:@"EXT-X-KEY:"]) {
-                        NSArray *furtherComponents = [line componentsSeparatedByString:@","];
-                        for (NSString *component in furtherComponents) {
-                            if ([component containsString:@"URI"]) {
-                                [originalURIStrings addObject:component];
-                                NSString *finalString = [component stringByReplacingOccurrencesOfString:@"URI=\"" withString:@""];
-                                finalString = [finalString stringByReplacingOccurrencesOfString:@"\"" withString:@""];
-                                //                                        finalString = [NSString stringWithFormat:@"\"%@&token=%@\"", finalString, self.token];
-                                finalString = [NSString stringWithFormat:@"URI=%@", finalString];
-                                [updatedURIStrings addObject:finalString];
-                            }
+                        NSString *pattern = @"URI=\"([^\"]+)\"";
+                        NSString *keyURL = [[self extractStringUsingRegex:line withPattern:pattern] componentsSeparatedByString:@"\""][1];
+                        NSString *temp = [keyURL copy];
+                        if(![keyURL containsString:@"http"] && ![keyURL containsString:@"https"]) {
+                            NSURL *url = [model.originalURL URLByDeletingLastPathComponent];
+                            NSString *fullURL = [NSString stringWithFormat:@"%@://%@%@/", @"fakekeyhttp", url.host, url.path];
+                            keyURL = [fullURL stringByAppendingString: keyURL];
+                        } else {
+                            NSURLComponents *newURL = [NSURLComponents componentsWithString:keyURL];
+                            newURL.scheme = @"fakekeyhttp";
+                            keyURL = [newURL.URL absoluteString];
                         }
+                        NSString *realURLString = [keyURL stringByReplacingOccurrencesOfString:@"fakekeyhttp" withString:@"https"];
+                        [self downloadKey:[NSURL URLWithString:realURLString] withHandler:^(NSData * _Nullable keyData, NSURLResponse * _Nullable responseKey, NSError * _Nullable error) {
+                            [self saveKeyToKeychain:keyData forKey:realURLString];
+                        }];
+                        [originalURIStrings addObject:temp];
+                        [updatedURIStrings addObject:keyURL];
                     }
                 }
             }
@@ -398,6 +417,66 @@ NS_INLINE CGFloat radiansToDegrees(CGFloat radians) {
     if (completion != nil) {
         completion(YES);
     }
+}
+
+-(void) downloadKey:(NSURL*)url withHandler:(void (NS_SWIFT_SENDABLE ^)(NSData * _Nullable data, NSURLResponse * _Nullable response, NSError * _Nullable error))completionHandler {
+    NSMutableURLRequest *requestFile = [NSMutableURLRequest requestWithURL:url];
+    requestFile.HTTPMethod = @"GET";
+    NSURLSession *session = [NSURLSession sessionWithConfiguration:NSURLSessionConfiguration.defaultSessionConfiguration];
+    NSURLSessionDataTask *dataTask = [session dataTaskWithRequest:requestFile completionHandler:completionHandler];
+    [dataTask resume];
+}
+
+- (void)saveKeyToKeychain:(NSData *)key forKey:(NSString *)keyIdentifier {
+    NSDictionary *query = @{
+        (__bridge id)kSecClass: (__bridge id)kSecClassGenericPassword,
+        (__bridge id)kSecAttrAccount: keyIdentifier,
+        (__bridge id)kSecValueData: key
+    };
+
+    OSStatus status = SecItemAdd((__bridge CFDictionaryRef)query, nil);
+    if (status != errSecSuccess) {
+        NSLog(@"Error saving key to Keychain: %d", (int)status);
+    }
+}
+
+- (NSData *)getKeyFromKeychain:(NSString *)keyIdentifier {
+    NSDictionary *query = @{
+        (__bridge id)kSecClass: (__bridge id)kSecClassGenericPassword,
+        (__bridge id)kSecAttrAccount: keyIdentifier,
+        (__bridge id)kSecReturnData: (__bridge id)kCFBooleanTrue
+    };
+
+    CFDataRef keyData = NULL;
+    OSStatus status = SecItemCopyMatching((__bridge CFDictionaryRef)query, (CFTypeRef *)&keyData);
+
+    if (status == errSecSuccess && keyData != NULL) {
+        NSData *key = (__bridge_transfer NSData *)keyData;
+        return key;
+    }
+
+    return nil;
+}
+
+
+- (NSString *)extractStringUsingRegex:(NSString *)inputString withPattern:(NSString *)regexPattern {
+    NSError *error = nil;
+    NSRegularExpression *regex = [NSRegularExpression regularExpressionWithPattern:regexPattern options:0 error:&error];
+
+    if (!error) {
+        NSRange range = NSMakeRange(0, [inputString length]);
+        NSTextCheckingResult *match = [regex firstMatchInString:inputString options:0 range:range];
+
+        if (match) {
+            // Extract the matched substring using the range
+            NSRange matchedRange = [match range];
+            return [inputString substringWithRange:matchedRange];
+        }
+    } else {
+        NSLog(@"Error creating regex: %@", [error localizedDescription]);
+    }
+
+    return nil; // Return nil if no match or error
 }
 
 - (NSURLRequest *)generateRedirectURLRequestWithSourceURL:(NSString *)sourceURL {
