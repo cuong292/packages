@@ -20,6 +20,7 @@ import static com.google.android.exoplayer2.util.Util.castNonNull;
 import static java.lang.Math.min;
 
 import android.net.Uri;
+import android.util.Base64;
 
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
@@ -43,6 +44,8 @@ import com.google.common.collect.Sets;
 import com.google.common.net.HttpHeaders;
 import com.google.errorprone.annotations.CanIgnoreReturnValue;
 
+import org.json.JSONObject;
+
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
@@ -60,6 +63,9 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.zip.GZIPInputStream;
+
+import javax.crypto.SecretKey;
+import javax.crypto.spec.SecretKeySpec;
 
 
 /**
@@ -483,54 +489,47 @@ public class CustomHTTPDataSource extends BaseDataSource implements HttpDataSour
             // length in this case.
             bytesToRead = dataSpec.length;
         }
-
-        if (responseCode == 200) {
-            String requestURL = connection.getURL().toString();
+        String requestURL = connection.getURL().toString();
+        if (responseCode == 200 && (requestURL.contains(".m3u8") || requestURL.contains(".key"))) {
+            InputStream inputStreamData;
+            ByteArrayOutputStream outputStream = null;
             if (requestURL.contains(".m3u8") || requestURL.contains(".key")) {
                 try {
-                    InputStream inputStreamData = connection.getInputStream();
-                    long contentLength = 0;
-                    if (!isCompressed) {
-                        if (dataSpec.length != C.LENGTH_UNSET) {
-                            bytesToRead = dataSpec.length;
-                        } else {
-                            contentLength =
-                                    HttpUtil.getContentLength(
-                                            connection.getHeaderField(HttpHeaders.CONTENT_LENGTH),
-                                            connection.getHeaderField(HttpHeaders.CONTENT_RANGE));
-                        }
-                    } else {
-                        // Gzip is enabled. If the server opts to use gzip then the content length in the response
-                        // will be that of the compressed data, which isn't what we want. Always use the dataSpec
-                        // length in this case.
+                    inputStreamData = connection.getInputStream();
+                    if (isCompressed) {
                         inputStreamData = new GZIPInputStream(inputStreamData);
-                        contentLength = dataSpec.length;
                     }
-                    String responseData;
-                    if (contentLength <= 0) {
-                        ByteArrayOutputStream bos = new ByteArrayOutputStream();
-                        int byteData = inputStreamData.read();
-                        while (byteData != -1) {
-                            bos.write(byteData);
-                            byteData = inputStreamData.read();
-                        }
-                        responseData = new String(android.util.Base64.decode(bos.toByteArray(), android.util.Base64.DEFAULT), StandardCharsets.
+
+                    outputStream = new ByteArrayOutputStream();
+                    int byteData = inputStreamData.read();
+                    while (byteData != -1) {
+                        outputStream.write(byteData);
+                        byteData = inputStreamData.read();
+                    }
+                    String responseData = "";
+                    if (requestURL.contains(".key")) {
+                        String jsonString = new String(outputStream.toByteArray(), StandardCharsets.
                                 UTF_8);
+                        JSONObject jsonObject = new JSONObject(jsonString);
+                        String keyData = jsonObject.getString("key");
+                        keyData = new String(Base64.decode(keyData, Base64.DEFAULT));
+                        byte[] keyAsBytes = keyData.getBytes();
+                        mInterruptBytesToRead = keyAsBytes.length;
+                        mInterruptInputStream = new ByteArrayInputStream(keyAsBytes);
                     } else {
-                        byte[] buffer = new byte[(int) contentLength];
-                        int byteData = inputStreamData.read(buffer);
-                        while (byteData != -1) {
-                            byteData = inputStreamData.read(buffer);
-                        }
-                        responseData = new String(android.util.Base64.decode(buffer, android.util.Base64.DEFAULT), StandardCharsets.
+                        responseData = new String(android.util.Base64.decode(outputStream.toByteArray(), android.util.Base64.DEFAULT), StandardCharsets.
                                 UTF_8);
+                        byte[] decryptedData = responseData.getBytes();
+                        mInterruptBytesToRead = decryptedData.length;
+                        mInterruptInputStream = new ByteArrayInputStream(responseData.getBytes());
                     }
-
-                    byte[] decryptedData = responseData.getBytes();
-                    mInterruptBytesToRead = decryptedData.length;
-                    mInterruptInputStream = new ByteArrayInputStream(responseData.getBytes());
                 } catch (Exception ignored) {
-
+                    if (outputStream != null) {
+                        byte[] bytes = outputStream.toByteArray();
+                        mInterruptInputStream = new ByteArrayInputStream(bytes);
+                        mInterruptBytesToRead = bytes.length;
+                    }
+                    android.util.Log.d(TAG, "open: ");
                 }
             }
         }
